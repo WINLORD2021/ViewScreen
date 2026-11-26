@@ -1,0 +1,111 @@
+name: ViewScreen 0.1 - Build 1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select and verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST=ViewScreen-Host-0.1-Build1.zip
+          CLIENT=ViewScreen-Client-0.1-Build1.zip
+          if [[ -f "$HOST" && ! -f "$CLIENT" ]]; then
+            ZIP="$HOST"
+            SHA=719563a8e5b46d905b39e94ad3afb9d4fe335453568e2f795549dd220f6f3b87
+          elif [[ -f "$CLIENT" && ! -f "$HOST" ]]; then
+            ZIP="$CLIENT"
+            SHA=004287aa4d739fea61c14d37d1e9425caaef6fd4174ecf90eea029e18a5aafeb
+          else
+            echo 'Use exactly one source ZIP per repository.'
+            exit 1
+          fi
+          echo "$SHA  $ZIP" | sha256sum -c -
+          echo "APP=${ZIP%.zip}" >> "$GITHUB_ENV"
+          mkdir -p project
+          unzip -q "$ZIP" -d project
+          test -f project/app/build.gradle
+          test -f project/settings.gradle
+          test -f project/app/src/main/AndroidManifest.xml
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          echo "VIEWSCREEN_SDK=$SDK" >> "$GITHUB_ENV"
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Configure release signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/viewscreen.keystore"
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            : "${KEYSTORE_PASSWORD:?Missing store password}"
+            : "${KEY_ALIAS:?Missing key alias}"
+            : "${KEY_PASSWORD:?Missing key password}"
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          else
+            echo '::warning::Temporary signing key; fresh installations only.'
+            KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
+            KEY_PASSWORD="$KEYSTORE_PASSWORD"
+            KEY_ALIAS=viewscreen
+            echo "::add-mask::$KEYSTORE_PASSWORD"
+            keytool -genkeypair -keystore "$KEYSTORE" -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname 'CN=TNR_, O=TNR_'
+          fi
+          {
+            echo "VIEWSCREEN_KEYSTORE=$KEYSTORE"
+            echo "VIEWSCREEN_STORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "VIEWSCREEN_KEY_ALIAS=$KEY_ALIAS"
+            echo "VIEWSCREEN_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Compile and assemble APK
+        working-directory: project
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp project/app/build/outputs/apk/release/app-release.apk "output/$APP.apk"
+          "$VIEWSCREEN_SDK/build-tools/35.0.0/apksigner" verify --verbose --print-certs "output/$APP.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean signing files
+        if: always()
+        run: rm -f "$RUNNER_TEMP/viewscreen.keystore"
