@@ -1,4 +1,5 @@
-name: ViewScreen 0.1 - Build 1
+
+name: ViewScreen 0.2 - UI Revision 5
 
 on:
   workflow_dispatch:
@@ -9,45 +10,78 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v6
 
-      - name: Select and verify source
+      - name: Verify and extract source
         shell: bash
         run: |
           set -euo pipefail
-          HOST=ViewScreen-Host-0.1-Build1.zip
-          CLIENT=ViewScreen-Client-0.1-Build1.zip
-          if [[ -f "$HOST" && ! -f "$CLIENT" ]]; then
-            ZIP="$HOST"
-            SHA=719563a8e5b46d905b39e94ad3afb9d4fe335453568e2f795549dd220f6f3b87
-          elif [[ -f "$CLIENT" && ! -f "$HOST" ]]; then
-            ZIP="$CLIENT"
-            SHA=004287aa4d739fea61c14d37d1e9425caaef6fd4174ecf90eea029e18a5aafeb
-          else
-            echo 'Use exactly one source ZIP per repository.'
-            exit 1
-          fi
-          echo "$SHA  $ZIP" | sha256sum -c -
-          echo "APP=${ZIP%.zip}" >> "$GITHUB_ENV"
+          ZIP=ViewScreen-Client-0.2-Rev5.zip
+          echo "84067944b508d8e7c9c9a3baaa8149287fb2b47b645c0bc89f995285905530a3  $ZIP" | sha256sum -c -
           mkdir -p project
           unzip -q "$ZIP" -d project
           test -f project/app/build.gradle
           test -f project/settings.gradle
-          test -f project/app/src/main/AndroidManifest.xml
 
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
+      - name: Test protocol and stability detector
+        run: bash project/tests/run.sh
+
       - name: Prepare Android SDK
         shell: bash
         run: |
           set -euo pipefail
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          test -n "$SDK"
-          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [[ ! -d "$SDK" ]]; then
+            echo "::error::Android SDK directory not found: $SDK"
+            exit 1
+          fi
+
+          echo "SDK: $SDK"
+
+          if [[ ! -f "$SDK/platforms/android-35/android.jar" || ! -x "$SDK/build-tools/35.0.0/apksigner" ]]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+            if [[ ! -x "$SM" ]]; then
+              SM="$(command -v sdkmanager || true)"
+            fi
+
+            if [[ ! -x "$SM" ]]; then
+              SM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+            fi
+
+            if [[ ! -x "$SM" ]]; then
+              echo '::error::sdkmanager not found'
+              exit 1
+            fi
+
+            set +e
+            yes | "$SM" --sdk_root="$SDK" --licenses
+            RESULT=${PIPESTATUS[1]}
+            set -e
+
+            if [[ "$RESULT" != 0 ]]; then
+              echo "::error::SDK license acceptance failed ($RESULT)"
+              exit "$RESULT"
+            fi
+
+            "$SM" --sdk_root="$SDK" \
+              'platforms;android-35' \
+              'build-tools;35.0.0'
+          fi
+
+          test -f "$SDK/platforms/android-35/android.jar"
+          test -x "$SDK/build-tools/35.0.0/apksigner"
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "VIEWSCREEN_SDK=$SDK" >> "$GITHUB_ENV"
 
       - uses: gradle/actions/setup-gradle@v5
@@ -64,22 +98,34 @@ jobs:
         run: |
           set -euo pipefail
           KEYSTORE="$RUNNER_TEMP/viewscreen.keystore"
+
           if [[ -n "$KEYSTORE_BASE64" ]]; then
-            : "${KEYSTORE_PASSWORD:?Missing store password}"
-            : "${KEY_ALIAS:?Missing key alias}"
+            : "${KEYSTORE_PASSWORD:?Missing password}"
+            : "${KEY_ALIAS:?Missing alias}"
             : "${KEY_PASSWORD:?Missing key password}"
+
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
           else
-            echo '::warning::Temporary signing key; fresh installations only.'
+            echo '::warning::Temporary key; fresh installations only.'
+
             KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
             KEY_PASSWORD="$KEYSTORE_PASSWORD"
             KEY_ALIAS=viewscreen
+
             echo "::add-mask::$KEYSTORE_PASSWORD"
-            keytool -genkeypair -keystore "$KEYSTORE" -storetype PKCS12 \
-              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
-              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 \
-              -validity 10000 -dname 'CN=TNR_, O=TNR_'
+
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname 'CN=TNR_, O=TNR_'
           fi
+
           {
             echo "VIEWSCREEN_KEYSTORE=$KEYSTORE"
             echo "VIEWSCREEN_STORE_PASSWORD=$KEYSTORE_PASSWORD"
@@ -87,21 +133,26 @@ jobs:
             echo "VIEWSCREEN_KEY_PASSWORD=$KEY_PASSWORD"
           } >> "$GITHUB_ENV"
 
-      - name: Compile and assemble APK
+      - name: Build APK
         working-directory: project
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Verify signed APK
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
-          cp project/app/build/outputs/apk/release/app-release.apk "output/$APP.apk"
-          "$VIEWSCREEN_SDK/build-tools/35.0.0/apksigner" verify --verbose --print-certs "output/$APP.apk"
+
+          APK=output/ViewScreen-Client-0.2-Rev5.apk
+
+          cp project/app/build/outputs/apk/release/app-release.apk "$APK"
+
+          "$VIEWSCREEN_SDK/build-tools/35.0.0/apksigner" \
+            verify --verbose --print-certs "$APK"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP }}
+          name: ViewScreen-Client-0.2-Rev5
           path: output/*.apk
           if-no-files-found: error
           retention-days: 30
