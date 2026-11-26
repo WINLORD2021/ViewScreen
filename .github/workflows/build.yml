@@ -1,5 +1,4 @@
-
-name: ViewScreen 0.2 - UI Revision 5
+name: ViewScreen 0.3 - Host and Client
 
 on:
   workflow_dispatch:
@@ -18,11 +17,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ZIP=ViewScreen-Client-0.2-Rev5.zip
-          echo "84067944b508d8e7c9c9a3baaa8149287fb2b47b645c0bc89f995285905530a3  $ZIP" | sha256sum -c -
+          ZIP=ViewScreen-0.3-Host-Client.zip
+
+          echo "f39b625e13988541644a7c87d4fa046d65c925ade1c5bb9a7d18af4b64ab094a  $ZIP" | sha256sum -c -
+
           mkdir -p project
           unzip -q "$ZIP" -d project
-          test -f project/app/build.gradle
+
+          test -f project/host/build.gradle
+          test -f project/client/build.gradle
           test -f project/settings.gradle
 
       - uses: actions/setup-java@v5
@@ -30,55 +33,21 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Test protocol and stability detector
+      - name: Test ViewScreen protocol
         run: bash project/tests/run.sh
 
       - name: Prepare Android SDK
         shell: bash
         run: |
           set -euo pipefail
+
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
-          if [[ ! -d "$SDK" ]]; then
-            echo "::error::Android SDK directory not found: $SDK"
-            exit 1
-          fi
-
-          echo "SDK: $SDK"
-
           if [[ ! -f "$SDK/platforms/android-35/android.jar" || ! -x "$SDK/build-tools/35.0.0/apksigner" ]]; then
-            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
-            if [[ ! -x "$SM" ]]; then
-              SM="$(command -v sdkmanager || true)"
-            fi
-
-            if [[ ! -x "$SM" ]]; then
-              SM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
-            fi
-
-            if [[ ! -x "$SM" ]]; then
-              echo '::error::sdkmanager not found'
-              exit 1
-            fi
-
-            set +e
-            yes | "$SM" --sdk_root="$SDK" --licenses
-            RESULT=${PIPESTATUS[1]}
-            set -e
-
-            if [[ "$RESULT" != 0 ]]; then
-              echo "::error::SDK license acceptance failed ($RESULT)"
-              exit "$RESULT"
-            fi
-
-            "$SM" --sdk_root="$SDK" \
+            sdkmanager --sdk_root="$SDK" \
               'platforms;android-35' \
               'build-tools;35.0.0'
           fi
-
-          test -f "$SDK/platforms/android-35/android.jar"
-          test -x "$SDK/build-tools/35.0.0/apksigner"
 
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
@@ -97,6 +66,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
           KEYSTORE="$RUNNER_TEMP/viewscreen.keystore"
 
           if [[ -n "$KEYSTORE_BASE64" ]]; then
@@ -106,7 +76,7 @@ jobs:
 
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
           else
-            echo '::warning::Temporary key; fresh installations only.'
+            echo '::warning::Temporary signing key. Fresh installations only.'
 
             KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
             KEY_PASSWORD="$KEYSTORE_PASSWORD"
@@ -133,26 +103,34 @@ jobs:
             echo "VIEWSCREEN_KEY_PASSWORD=$KEY_PASSWORD"
           } >> "$GITHUB_ENV"
 
-      - name: Build APK
+      - name: Build Host and Client
         working-directory: project
-        run: gradle :app:assembleRelease --no-daemon --stacktrace
+        run: |
+          gradle \
+            :host:assembleRelease \
+            :client:assembleRelease \
+            --no-daemon --stacktrace
 
-      - name: Verify APK
+      - name: Collect and verify APKs
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
 
-          APK=output/ViewScreen-Client-0.2-Rev5.apk
+          cp project/host/build/outputs/apk/release/host-release.apk \
+            output/ViewScreen-Host-0.3.apk
 
-          cp project/app/build/outputs/apk/release/app-release.apk "$APK"
+          cp project/client/build/outputs/apk/release/client-release.apk \
+            output/ViewScreen-Client-0.3.apk
 
-          "$VIEWSCREEN_SDK/build-tools/35.0.0/apksigner" \
-            verify --verbose --print-certs "$APK"
+          for APK in output/*.apk; do
+            "$VIEWSCREEN_SDK/build-tools/35.0.0/apksigner" \
+              verify --verbose --print-certs "$APK"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ViewScreen-Client-0.2-Rev5
+          name: ViewScreen-0.3-Host-Client
           path: output/*.apk
           if-no-files-found: error
           retention-days: 30
